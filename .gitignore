@@ -2,44 +2,44 @@ import json
 import os
 import re
 import time
+import winsound
+from datetime import datetime
 
 from plyer import notification
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ==========================
-# SETTINGS
-# ==========================
 
-ORIGIN = "MSY"          # New Orleans
-DESTINATION = "KTM"     # Kathmandu
-DEPARTURE_DATE = "2026-11-10"
+ORIGIN = "MSY"
+DESTINATION = "KTM"
 
-PRICE_FILE = "qatar_msy_ktm_price.json"
+DEPARTURE_DATE = "2026-11-18"
+RETURN_DATE = "2026-11-30"
 
-ALERT_THRESHOLD = 50
-TARGET_PRICE = 1300
+TARGET_PRICE = 1700
+MIN_VALID_FARE = 900
+MAX_VALID_FARE = 4000
 
-AIRLINE_KEYWORDS = ["Qatar", "Qatar Airways"]
+PRICE_FILE = "qatar_msy_ktm_roundtrip_price.json"
+ROUTE_KEY = "QATAR_MSY_KTM_ROUNDTRIP"
 
-# ==========================
-# DESKTOP NOTIFICATION
-# ==========================
+CHECK_EVERY_MINUTES = 60   # change to 30, 120, etc.
+
 
 def send_notification(title, message):
     try:
+        winsound.Beep(2000, 1200)
         notification.notify(
             title=title,
             message=message,
             timeout=15
         )
+        print(f"\nNOTIFICATION: {title}")
+        print(message)
     except Exception as e:
         print("Notification error:", e)
 
-# ==========================
-# PRICE STORAGE
-# ==========================
 
 def load_prices():
     if os.path.exists(PRICE_FILE):
@@ -47,75 +47,83 @@ def load_prices():
             return json.load(f)
     return {}
 
+
 def save_prices(prices):
     with open(PRICE_FILE, "w") as f:
         json.dump(prices, f, indent=2)
 
-# ==========================
-# GOOGLE FLIGHTS CHECKER
-# ==========================
 
-def get_qatar_price(driver):
+def get_qatar_roundtrip_price(driver):
 
     url = (
         f"https://www.google.com/travel/flights?"
-        f"hl=en#flt={ORIGIN}.{DESTINATION}.{DEPARTURE_DATE};"
+        f"hl=en#flt={ORIGIN}.{DESTINATION}.{DEPARTURE_DATE}*"
+        f"{DESTINATION}.{ORIGIN}.{RETURN_DATE};"
         f"c:USD;e:1;sd:1;t:f"
     )
 
-    print(f"Checking Qatar Airways: {ORIGIN} → {DESTINATION}")
+    print("\n==============================")
+    print("Checking Qatar Airways fare")
+    print(f"{ORIGIN} ↔ {DESTINATION}")
+    print(f"Depart: {DEPARTURE_DATE}")
+    print(f"Return: {RETURN_DATE}")
+    print(datetime.now().strftime("%Y-%m-%d %I:%M:%S %p"))
     print(url)
 
     driver.get(url)
-    time.sleep(12)
+    time.sleep(35)
 
-    html = driver.page_source
+    page_text = driver.find_element("tag name", "body").text
 
-    if not any(keyword in html for keyword in AIRLINE_KEYWORDS):
-        print("Qatar Airways not found on this page.")
+    with open("google_flights_text.txt", "w", encoding="utf-8") as f:
+        f.write(page_text)
+
+    if not page_text.strip():
+        print("Page text is empty.")
         return None
 
-    # Try to find dollar amounts near Qatar text
-    qatar_sections = re.findall(
-        r"Qatar.{0,1500}?\$([0-9,]+)|\$([0-9,]+).{0,1500}?Qatar",
-        html,
-        flags=re.IGNORECASE | re.DOTALL
-    )
+    if "qatar" not in page_text.lower():
+        print("Qatar Airways not found on visible page.")
+        print("Open google_flights_text.txt to inspect what Google showed.")
+        return None
 
-    prices = []
+    lines = page_text.splitlines()
+    qatar_prices = []
 
-    for match in qatar_sections:
-        for p in match:
-            if p:
+    for i, line in enumerate(lines):
+        if "qatar" in line.lower():
+            nearby_text = "\n".join(lines[max(0, i - 25): i + 35])
+            found_prices = re.findall(r"\$([0-9,]+)", nearby_text)
+
+            for p in found_prices:
                 try:
                     value = int(p.replace(",", ""))
-                    if 300 <= value <= 5000:
-                        prices.append(value)
+                    if MIN_VALID_FARE <= value <= MAX_VALID_FARE:
+                        qatar_prices.append(value)
                 except:
                     pass
 
-    if not prices:
-        print("No Qatar fare price detected.")
+    qatar_prices = sorted(set(qatar_prices))
+
+    print("Qatar-related fares detected:")
+    print(qatar_prices)
+
+    if not qatar_prices:
+        print("Qatar was found, but no nearby valid fare was detected.")
+        print("Open google_flights_text.txt to inspect the page.")
         return None
 
-    return min(prices)
+    return min(qatar_prices)
 
-# ==========================
-# MAIN
-# ==========================
 
-def main():
+def run_once():
 
     old_prices = load_prices()
-    new_prices = {}
 
     options = webdriver.ChromeOptions()
-
-    # Remove this line if you want to see Chrome open
-    options.add_argument("--headless=new")
-
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--start-maximized")
 
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
@@ -123,56 +131,57 @@ def main():
     )
 
     try:
-        price = get_qatar_price(driver)
+        price = get_qatar_roundtrip_price(driver)
 
         if price is None:
             send_notification(
-                "Qatar Flight Tracker",
-                "Could not find Qatar fare for MSY → KTM."
+                "Qatar MSY ↔ KTM Tracker",
+                "Could not detect Qatar roundtrip fare."
             )
             return
 
-        print(f"Qatar fare found: ${price}")
+        print(f"Lowest Qatar roundtrip fare detected: ${price}")
 
-        new_prices["QATAR_MSY_KTM"] = price
-        previous = old_prices.get("QATAR_MSY_KTM")
-
-        if previous is None:
-            send_notification(
-                "Qatar Flight Tracker",
-                f"Baseline saved: MSY → KTM Qatar fare ${price}"
-            )
-
-        else:
-            change = price - previous
-
-            if change <= -ALERT_THRESHOLD:
-                send_notification(
-                    "✈ Qatar Fare Dropped",
-                    f"MSY → KTM\n${previous} → ${price}\nSaved ${abs(change)}"
-                )
-
-            elif change >= ALERT_THRESHOLD:
-                send_notification(
-                    "⚠ Qatar Fare Increased",
-                    f"MSY → KTM\n${previous} → ${price}\n+${change}"
-                )
+        previous = old_prices.get(ROUTE_KEY)
 
         if price <= TARGET_PRICE:
             send_notification(
-                "🔥 Qatar Kathmandu Deal",
-                f"MSY → KTM Qatar fare is ${price}"
+                "🔥 Qatar Fare Alert",
+                f"MSY ↔ KTM Qatar roundtrip is ${price}\nTarget: ${TARGET_PRICE}"
             )
+        else:
+            print(f"Qatar fare is above target: ${price}")
+
+        if previous is not None:
+            change = price - previous
+            if abs(change) >= 50:
+                if change < 0:
+                    send_notification(
+                        "✈ Qatar Fare Dropped",
+                        f"MSY ↔ KTM\n${previous} → ${price}"
+                    )
+                else:
+                    send_notification(
+                        "⚠ Qatar Fare Increased",
+                        f"MSY ↔ KTM\n${previous} → ${price}"
+                    )
+
+        old_prices[ROUTE_KEY] = price
+        save_prices(old_prices)
 
     finally:
         driver.quit()
 
-    save_prices(new_prices)
-    print("Done.")
 
-# ==========================
-# RUN
-# ==========================
+def start_tracker():
+    while True:
+        run_once()
+        print(f"\nNext check in {CHECK_EVERY_MINUTES} minutes.")
+        time.sleep(CHECK_EVERY_MINUTES * 60)
 
-if __name__ == "__main__":
-    main()
+
+# Run one time only:
+run_once()
+
+# To keep tracking every hour, run this instead:
+# start_tracker()
